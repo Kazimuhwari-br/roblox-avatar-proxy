@@ -1,116 +1,144 @@
 // worker.js — Roblox Avatar Proxy (Cloudflare Worker)
-// Sem dependências externas. Cache em memória (não usa KV nem D1).
+// Sem dependências externas. Cache em memória.
+//
+// Uso: https://SUA-WORKER.workers.dev/avatar/v1/users/{userId}/outfits
+//
+// Mudanças desta versão:
+//  - Tenta roblox.com primeiro e, se for bloqueado/limitado (403/429/5xx),
+//    tenta roproxy.com automaticamente.
+//  - Quando falha, devolve o erro REAL (status + corpo do upstream) em JSON,
+//    para você conseguir ver o que está acontecendo.
+//  - Headers X-Upstream / X-Upstream-Status em toda resposta (debug).
 
 const SUBDOMINIOS_PERMITIDOS = ["avatar", "thumbnails"];
-const CACHE_SEGUNDOS = 300;      // 5 minutos
-const CACHE_MAX_ENTRADAS = 500;  // limpeza ao ultrapassar
+const DOMINIOS_UPSTREAM = ["roblox.com", "roproxy.com"];
+const CACHE_SEGUNDOS = 300;
+const CACHE_MAX_ENTRADAS = 500;
 
 const cache = new Map();
 
 function limparCache() {
 	const agora = Date.now();
 	for (const [chave, item] of cache) {
-		if (agora - item.em > CACHE_SEGUNDOS * 1000) {
-			cache.delete(chave);
-		}
+		if (agora - item.em > CACHE_SEGUNDOS * 1000) cache.delete(chave);
 	}
 	while (cache.size > CACHE_MAX_ENTRADAS) {
 		cache.delete(cache.keys().next().value);
 	}
 }
 
-function respostaCors(corpo, status, headersExtra) {
-	const headers = new Headers(headersExtra);
+function resposta(corpo, status, extra) {
+	const headers = new Headers(extra);
 	headers.set("Access-Control-Allow-Origin", "*");
 	return new Response(corpo, { status, headers });
+}
+
+// Status em que vale a pena tentar outro upstream
+function deveTentarOutro(status) {
+	return status === 403 || status === 429 || status >= 500;
 }
 
 export default {
 	async fetch(request) {
 		const url = new URL(request.url);
 
-		// Preflight CORS (para testar no navegador)
 		if (request.method === "OPTIONS") {
-			return respostaCors(null, 204, {
+			return resposta(null, 204, {
 				"Access-Control-Allow-Methods": "GET, HEAD",
 				"Access-Control-Allow-Headers": "Accept"
 			});
 		}
 
 		if (request.method !== "GET" && request.method !== "HEAD") {
-			return respostaCors("Metodo nao permitido", 405);
+			return resposta("Metodo nao permitido", 405);
 		}
 
 		const partes = url.pathname.split("/");
 		const sub = (partes[1] || "").toLowerCase();
 
 		if (!SUBDOMINIOS_PERMITIDOS.includes(sub)) {
-			return respostaCors("Subdominio nao permitido", 403);
+			return resposta(
+				JSON.stringify({ error: "Subdominio nao permitido", permitidos: SUBDOMINIOS_PERMITIDOS }),
+				403,
+				{ "Content-Type": "application/json" }
+			);
 		}
 
 		const caminho = "/" + partes.slice(2).join("/");
-		const destino = new URL(caminho + url.search, `https://${sub}.roblox.com`);
-		const chaveCache = destino.toString();
+		const chaveCache = sub + caminho + url.search;
 
-		// CACHE HIT — devolve sem consultar o Roblox
+		// CACHE HIT
 		const agora = Date.now();
 		const item = cache.get(chaveCache);
 		if (item && agora - item.em < CACHE_SEGUNDOS * 1000) {
-			return respostaCors(request.method === "HEAD" ? null : item.corpo, item.status, {
+			return resposta(request.method === "HEAD" ? null : item.corpo, item.status, {
 				"Content-Type": item.contentType,
-				"X-Cache": "HIT"
+				"X-Cache": "HIT",
+				"X-Upstream": item.upstream
 			});
 		}
 
-		// Headers limpos: não encaminha os headers do HttpService
-		const headers = new Headers();
-		headers.set("Accept", "application/json");
-		headers.set(
-			"User-Agent",
-			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
-		);
+		const tentativas = [];
+		let ultimo = null;
 
-		try {
-			const resposta = await fetch(destino.toString(), {
-				method: request.method,
-				headers,
-				redirect: "follow"
-			});
+		for (const dominio of DOMINIOS_UPSTREAM) {
+			const destino = `https://${sub}.${dominio}${caminho}${url.search}`;
 
-			// Erros (429, 403...) passam direto, sem cachear
-			if (!resposta.ok) {
-				const corpoErro = await resposta.text();
-			return respostaCors(corpoErro, resposta.status, {
-				"Content-Type": "application/json",
-				"X-Cache": "MISS"
-			});
+			try {
+				const upstream = await fetch(destino, {
+					method: "GET",
+					headers: {
+						"Accept": "application/json",
+						"User-Agent":
+							"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+					},
+					redirect: "follow"
+				});
+
+				const corpo = await upstream.text();
+				const contentType = upstream.headers.get("Content-Type") || "application/json";
+
+				if (upstream.ok) {
+					cache.set(chaveCache, {
+						em: agora,
+						status: upstream.status,
+						corpo,
+						contentType,
+						upstream: dominio
+					});
+					limparCache();
+
+					return resposta(request.method === "HEAD" ? null : corpo, upstream.status, {
+						"Content-Type": contentType,
+						"X-Cache": "MISS",
+						"X-Upstream": dominio
+					});
+				}
+
+				tentativas.push({ dominio, status: upstream.status, corpo: corpo.slice(0, 500) });
+				ultimo = { status: upstream.status, corpo, contentType, dominio };
+
+				// Erro "de verdade" (400, 404...) -> não adianta tentar outro
+				if (!deveTentarOutro(upstream.status)) break;
+			} catch (error) {
+				tentativas.push({ dominio, status: 0, corpo: String(error) });
 			}
-
-			const corpo = await resposta.text();
-		const contentType = resposta.headers.get("Content-Type") || "application/json";
-
-			cache.set(chaveCache, {
-				em: agora,
-				status: resposta.status,
-				corpo,
-				contentType
-			});
-			limparCache();
-
-			return respostaCors(request.method === "HEAD" ? null : corpo, resposta.status, {
-				"Content-Type": contentType,
-				"X-Cache": "MISS"
-			});
-		} catch (error) {
-			return respostaCors(
-				JSON.stringify({
-					error: "Falha ao consultar a Roblox",
-					message: String(error),
-				destination: destino.toString()
-			}),
-			502,
-			{ "Content-Type": "application/json" }
-			);
 		}
+
+		// Falhou em todos: devolve o erro real para facilitar o debug
+		const statusFinal = ultimo ? ultimo.status : 502;
+		return resposta(
+			JSON.stringify({
+				error: "Falha ao consultar a Roblox",
+				caminho: `/${sub}${caminho}${url.search}`,
+				tentativas
+			}),
+			statusFinal,
+			{
+				"Content-Type": "application/json",
+				"X-Cache": "MISS",
+				"X-Upstream-Status": String(statusFinal)
+			}
+		);
 	}
 };
